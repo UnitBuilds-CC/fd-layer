@@ -1,0 +1,196 @@
+--- a/src/backends/chunked.rs
++++ b/src/backends/chunked.rs
+@@ -197,7 +197,13 @@
+             }
+             Some(Fault::Error) => {
+                 self.stats.errors.fetch_add(1, Ordering::Relaxed);
+-                return Err(Error::backend(self.backend, "injected read failure"));
++                // One-shot arming: only this read fails, so a retry succeeds. That is exactly a
++                // transient backend failure, and it is how the caller can tell (via
++                // `Error::is_transient`) without string-matching.
++                return Err(Error::backend_transient(
++                    self.backend,
++                    "injected read failure",
++                ));
+             }
+             None => {}
+         }
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -47,4 +47,4 @@
+ pub use ofd::{OpenFileDescription, SharedRead};
+ pub use process::Process;
+ pub use resource::{Filesystem, Resource};
+-pub use types::{Access, Error, FileId, RawFd, ReadOutcome, Result, MAX_FD};
++pub use types::{Access, BackendErrorKind, Error, FileId, RawFd, ReadOutcome, Result, MAX_FD};
+--- a/src/types.rs
++++ b/src/types.rs
+@@ -92,9 +92,24 @@
+     }
+ }
+ 
++/// Whether a backend-reported failure is expected to clear on its own. This is the *typed* half
++/// of [`Error::Backend`]: the `message` carries the backend's opaque detail for humans, while
++/// `kind` is the machine-readable retry signal a caller (or [`Error::is_transient`]) branches on —
++/// so a retrying read loop never has to string-match an error description.
++#[derive(Debug, Clone, Copy, PartialEq, Eq)]
++pub enum BackendErrorKind {
++    /// Backpressure, a momentary socket refusal, a one-shot injected fault: retrying the same
++    /// read is expected to eventually succeed.
++    Transient,
++    /// A hard failure the same read will not fix by repeating (decode error, gone resource, I/O
++    /// fault): the caller should surface it rather than spin.
++    Permanent,
++}
++
+ /// Layer errors. Kept as one enum so callers can match on the semantic condition rather than a
+-/// backend-specific error type; the backend's own failure detail is carried in [`Error::Backend`]
+-/// as an opaque string (a real port would carry a typed source here).
++/// backend-specific error type; the backend's own failure detail is carried in [`Error::Backend`],
++/// split into an opaque `message` and a typed [`BackendErrorKind`] so retry policy is a type
++/// decision, not a string comparison.
+ #[derive(Debug, Clone, PartialEq, Eq)]
+ pub enum Error {
+     /// The file identity does not exist in the target backend.
+@@ -115,24 +130,48 @@
+     /// Non-blocking operation could not proceed right now (a contending reader holds the shared
+     /// cursor, or the backend momentarily has no data). Corresponds to `EAGAIN`/`EWOULDBLOCK`.
+     WouldBlock,
+-    /// A backend reported a failure reading. The resource is left unchanged.
++    /// A backend reported a failure reading. The resource is left unchanged. `kind` says whether a
++    /// retry is worthwhile; construct via [`Error::backend`] (permanent) or [`Error::backend_transient`].
+     Backend {
+         backend: &'static str,
+         message: String,
++        kind: BackendErrorKind,
+     },
+ }
+ 
+ impl Error {
++    /// A permanent backend failure (the safe default: retrying is not assumed to help).
+     pub fn backend(backend: &'static str, message: impl Into<String>) -> Self {
+         Error::Backend {
+             backend,
+             message: message.into(),
++            kind: BackendErrorKind::Permanent,
++        }
++    }
++
++    /// A transient backend failure — retrying the same read may succeed. [`Error::is_transient`]
++    /// reports `true` for these (and for [`Error::WouldBlock`]).
++    pub fn backend_transient(backend: &'static str, message: impl Into<String>) -> Self {
++        Error::Backend {
++            backend,
++            message: message.into(),
++            kind: BackendErrorKind::Transient,
+         }
+     }
+ 
+-    /// Whether this error is a transient "try again" rather than a hard failure.
++    /// Whether this error is a transient "try again" rather than a hard failure. `WouldBlock` (the
++    /// shared cursor is momentarily held, or a stream has no data yet) and any backend failure the
++    /// backend itself flagged [`BackendErrorKind::Transient`] both qualify; everything else is
++    /// terminal for this attempt.
+     pub fn is_transient(&self) -> bool {
+-        matches!(self, Error::WouldBlock)
++        matches!(
++            self,
++            Error::WouldBlock
++                | Error::Backend {
++                    kind: BackendErrorKind::Transient,
++                    ..
++                }
++        )
+     }
+ }
+ 
+@@ -147,8 +186,16 @@
+             Error::UnknownBackend(b) => write!(f, "unknown backend: {b}"),
+             Error::BackendShutdown(b) => write!(f, "backend '{b}' is shut down"),
+             Error::WouldBlock => write!(f, "operation would block"),
+-            Error::Backend { backend, message } => {
+-                write!(f, "backend '{backend}' error: {message}")
++            Error::Backend {
++                backend,
++                message,
++                kind,
++            } => {
++                let word = match kind {
++                    BackendErrorKind::Transient => "transient",
++                    BackendErrorKind::Permanent => "permanent",
++                };
++                write!(f, "backend '{backend}' {word} error: {message}")
+             }
+         }
+     }
+--- a/tests/semantics.rs
++++ b/tests/semantics.rs
+@@ -6,7 +6,7 @@
+ 
+ use support::{corpus, drain, drain_pread, wired_process, READ};
+ 
+-use fd_layer::{Access, Error, OpenFileDescription, Process};
++use fd_layer::{Access, BackendErrorKind, Error, OpenFileDescription, Process};
+ 
+ // Each test rebinds the 4-tuple; the mem id is index 1, slow id index 2, chunked handle index 3.
+ macro_rules! wired {
+@@ -332,7 +332,7 @@
+     assert_eq!(
+         proc.position(fd).unwrap(),
+         before,
+-        "hard error moved nothing"
++        "backend error moved nothing"
+     );
+ 
+     // and the data is still all there once faults clear
+@@ -340,6 +340,50 @@
+ }
+ 
+ #[test]
++fn backend_errors_are_typed_for_retry() {
++    // #5: retry policy is a *type*, not a string match. The fallible backend distinguishes a
++    // transient one-shot fault from a permanent failure via `BackendErrorKind`, and `is_transient`
++    // reflects exactly that.
++    wired!(proc, _mem, slow, fs);
++    let fd = proc.open(slow, READ).unwrap();
++
++    // WouldBlock: transient.
++    fs.faults().arm_would_block();
++    let e = proc.read(fd, &mut [0u8; 4]).unwrap_err();
++    assert!(matches!(e, Error::WouldBlock));
++    assert!(e.is_transient(), "WouldBlock must be reported retryable");
++
++    // The injected one-shot fault is now a *transient* backend failure, carried by `kind`.
++    fs.faults().arm_error();
++    let e = proc.read(fd, &mut [0u8; 4]).unwrap_err();
++    assert!(
++        matches!(
++            e,
++            Error::Backend {
++                kind: BackendErrorKind::Transient,
++                ..
++            }
++        ),
++        "a one-shot fault must carry the Transient kind, not just a message"
++    );
++    assert!(e.is_transient());
++
++    // The constructor default is permanent, and permanent must NOT read as retryable.
++    let perm = Error::backend("chunked", "gone for good");
++    assert!(matches!(
++        perm,
++        Error::Backend {
++            kind: BackendErrorKind::Permanent,
++            ..
++        }
++    ));
++    assert!(
++        !perm.is_transient(),
++        "permanent must not be reported retryable"
++    );
++}
++
++#[test]
+ fn not_readable_when_opened_write_only() {
+     wired!(proc, mem, _slow, _fs);
+     let fd = proc.open(mem, Access::WRITE).unwrap();

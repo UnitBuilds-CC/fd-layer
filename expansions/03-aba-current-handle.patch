@@ -1,0 +1,69 @@
+--- a/src/process.rs
++++ b/src/process.rs
+@@ -246,6 +246,19 @@
+         self.lock_table().is_open(fd)
+     }
+ 
++    /// Whether `ofd` is *still* the description occupying `fd` — the same `Arc`, not merely the
++    /// same file. This is the layer's ABA guard: a caller that captured an `Arc<OpenFileDescription>`
++    /// can ask, after a possible `close`, whether its handle refers to the live descriptor or to a
++    /// slot that was freed and re-opened (possibly to a different file) underneath it.
++    ///
++    /// The comparison is `Arc::ptr_eq` against the slot's current `Arc`, so it is exact and cheap.
++    /// Crucially it needs no generation counter in the guest-visible `u32` fd: the identity token is
++    /// the `Arc` the caller already holds, keeping the `type Fd = u32` journal contract intact.
++    pub fn is_current(&self, fd: RawFd, ofd: &Arc<OpenFileDescription>) -> bool {
++        self.lock_table()
++            .get(fd)
++            .is_some_and(|current| Arc::ptr_eq(&current, ofd))
++    }
+     // ---- whole file system --------------------------------------------------------
+ 
+     /// "Close the whole file system": shut a named backend down. Open descriptors stay in the
+--- a/tests/semantics.rs
++++ b/tests/semantics.rs
+@@ -26,6 +26,44 @@
+ }
+ 
+ #[test]
++fn is_current_distinguishes_a_reused_slot_from_a_stale_handle() {
++    // ABA: close a descriptor and re-open the *same slot* (a different file). The numeric fd is
++    // identical, so a guest holding only the u32 cannot tell them apart — a caller holding the OFD
++    // `Arc` can, without any generation counter leaking into the journal-visible fd.
++    wired!(proc, mem, slow, _fs);
++    let fd = proc.open(mem, READ).unwrap();
++    let stale = proc.get(fd).unwrap();
++    assert!(
++        proc.is_current(fd, &stale),
++        "handle matches the live descriptor"
++    );
++
++    proc.close(fd).unwrap();
++    let fd_again = proc.open(slow, READ).unwrap();
++    assert_eq!(
++        fd_again, fd,
++        "the numeric slot is reused (the ABA aliasing)"
++    );
++    assert!(proc.is_open(fd), "slot is occupied again");
++    assert!(
++        !proc.is_current(fd, &stale),
++        "stale handle must NOT match the freshly-opened descriptor"
++    );
++
++    let fresh = proc.get(fd).unwrap();
++    assert!(
++        proc.is_current(fd, &fresh),
++        "the new handle matches the live descriptor"
++    );
++
++    proc.close(fd).unwrap();
++    assert!(
++        !proc.is_current(fd, &fresh),
++        "after close, even the once-live handle is no longer current"
++    );
++}
++
++#[test]
+ fn descriptor_reuse_tracks_lowest_hole_across_interleaved_ops() {
+     // Guards the `next_free` accelerator in `Table`: open/dup must keep returning the *lowest* free
+     // fd even after closes create holes below the frontier and `open_at` creates holes above it.

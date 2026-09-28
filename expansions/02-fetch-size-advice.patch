@@ -1,0 +1,94 @@
+--- a/src/backends/chunked.rs
++++ b/src/backends/chunked.rs
+@@ -239,6 +239,12 @@
+     }
+ 
+     // No `as_shared_bytes` override: this backend cannot hand back the whole file.
++
++    fn preferred_read_size(&self) -> Option<usize> {
++        // The backend caps every read at `chunk_max` anyway, so advising that size lets a caller
++        // size its buffer to land exactly one chunk per fetch instead of over-allocating.
++        Some(self.chunk_max)
++    }
+ }
+ 
+ #[derive(Debug, Default)]
+--- a/src/ofd.rs
++++ b/src/ofd.rs
+@@ -49,6 +49,15 @@
+         self.resource.size()
+     }
+ 
++    /// The backend's preferred `read_at` granularity, if any (see
++    /// [`Resource::preferred_read_size`]). `Some(n)` — e.g. a chunked/network backend — is advice for
++    /// how large to size a buffer so sequential reads fetch a full natural unit instead of a
++    /// gratuitous short read; `None` — e.g. in-memory/disk — means the caller is free to pick any
++    /// size. Never a cap: reads larger or smaller than this are honored unchanged.
++    pub fn preferred_read_size(&self) -> Option<usize> {
++        self.resource.preferred_read_size()
++    }
++
+     /// Current sequential cursor.
+     pub fn position(&self) -> u64 {
+         *self.lock_position()
+--- a/src/resource.rs
++++ b/src/resource.rs
+@@ -34,6 +34,21 @@
+     ///   backends; the caller decides whether to continue.
+     fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<usize>;
+ 
++    /// Optional **fetch-size advice**: the number of bytes this backend naturally serves in one
++    /// [`Resource::read_at`], when it has a preference at all. `None` means "no preference" — an
++    /// in-memory or plain-file backend answers any request as cheaply as the next, so the caller
++    /// sizes buffers purely by its own needs. A block/range backend returns its granularity (chunk
++    /// size, page size, a typical remote range) so a caller can size buffers to avoid gratuitous
++    /// short reads without guessing.
++    ///
++    /// This is *advice only*: `read_at` is still free to return fewer bytes (a short read or EOF)
++    /// and is **not** capped to this value — a caller may hand it a larger or smaller buffer and
++    /// the contract above is unchanged. It exists so the layer can express the "this backend has a
++    /// natural read size" fact — which a seek-based handle cannot — without a downcast.
++    fn preferred_read_size(&self) -> Option<usize> {
++        None
++    }
++
+     /// Optional fast path: an owned, refcounted view of the whole resource when it already lives
+     /// in memory. Mirrors `virtual_fs::VirtualFile::as_owned_buffer` — return `Some` only when the
+     /// bytes are already resident and cloning is cheap (an `Arc` bump), never by copying the file.
+--- a/tests/semantics.rs
++++ b/tests/semantics.rs
+@@ -26,6 +26,34 @@
+ }
+ 
+ #[test]
++fn backend_advises_its_preferred_read_size() {
++    wired!(proc, mem, slow, _fs);
++    // The chunked backend caps every read at chunk_max (=8 in `wired_process`), so it advises 8 —
++    // a caller can size buffers to one natural unit without guessing or downcasting.
++    let fd_chunked = proc.open(slow, READ).unwrap();
++    assert_eq!(
++        proc.get(fd_chunked).unwrap().preferred_read_size(),
++        Some(8),
++        "a block-oriented backend reports its natural read unit"
++    );
++    // An in-memory backend has no preferred unit: any buffer is served as cheaply as the next.
++    let fd_mem = proc.open(mem, READ).unwrap();
++    assert_eq!(
++        proc.get(fd_mem).unwrap().preferred_read_size(),
++        None,
++        "an in-memory backend reports no preference"
++    );
++    // The advice is *not* a cap: a larger buffer is still served up to the backend's own real limit
++    // (chunk_max), so `read_at` governs the byte count and `preferred_read_size` only informs it.
++    let mut big = [0u8; 64];
++    let n = proc.read_at(fd_chunked, 0, &mut big).unwrap();
++    assert_eq!(
++        n, 8,
++        "read_at returns the backend's real chunk, not the advised size verbatim"
++    );
++}
++
++#[test]
+ fn is_current_distinguishes_a_reused_slot_from_a_stale_handle() {
+     // ABA: close a descriptor and re-open the *same slot* (a different file). The numeric fd is
+     // identical, so a guest holding only the u32 cannot tell them apart — a caller holding the OFD
