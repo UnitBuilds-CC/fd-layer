@@ -1,0 +1,13 @@
+[package]
+name = "fd-layer"
+version = "0.1.0"
+edition = "2021"
+# Oldest toolchain the crate is actually verified to build and test on, not a claim that newer
+# language features are needed. `rust-toolchain.toml` pins `stable`.
+rust-version = "1.95"
+description = "A standalone open-file-description layer: an abstract, concurrently-readable file descriptor model with pluggable backends."
+license = "MIT OR Apache-2.0"
+
+[dependencies]
+
+[dev-dependencies]
